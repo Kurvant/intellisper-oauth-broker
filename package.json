@@ -1,0 +1,27 @@
+{
+  "name": "intellisper-oauth-broker",
+  "version": "1.0.0",
+  "private": true,
+  "description": "Central OAuth2 token broker for Intellisper cloud + self-hosted connections. Holds provider client secrets and performs the code/refresh exchange on behalf of the platform, so provider secrets never live in the main app or in any customer's database.",
+  "type": "commonjs",
+  "main": "dist/index.js",
+  "scripts": {
+    "build": "tsc -p tsconfig.json",
+    "start": "node dist/index.js",
+    "dev": "tsx watch src/index.ts",
+    "lint": "eslint 'src/**/*.ts'"
+  },
+  "dependencies": {
+    "@fastify/rate-limit": "10.3.0",
+    "axios": "1.15.2",
+    "fastify": "5.8.5",
+    "pino": "10.1.0",
+    "zod": "4.3.6"
+  },
+  "devDependencies": {
+    "@types/node": "24.11.0",
+    "tsx": "4.21.0",
+    "typescript": "5.5.4",
+    "vitest": "3.0.8"
+  }
+}

@@ -1,0 +1,12 @@
+# Dependencies & build output
+node_modules/
+dist/
+
+# Secrets — NEVER commit. Only .env.example is tracked.
+.env
+.env.*
+!.env.example
+
+# Logs & local artifacts
+*.log
+.DS_Store
