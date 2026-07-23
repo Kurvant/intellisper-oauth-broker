@@ -36,6 +36,14 @@ const providersSchema = z.array(providerSchema)
 export type SecretStore = {
     /** Return the client secret for an exact (blockName, clientId) pair, or null if not registered. */
     lookup: (params: { blockName: string, clientId: string }) => string | null
+    /**
+     * The PUBLIC identity of every registered provider — (blockName, clientId) only, NEVER the
+     * secret. This is what the platform uses to discover which blocks are broker-managed so it can
+     * show a one-click Connect button instead of asking the user for their own credentials. The
+     * clientId is a public value (it is sent to the provider's authorize URL in the browser), so
+     * exposing it to the authenticated platform is safe; the clientSecret is deliberately absent.
+     */
+    list: () => { blockName: string, clientId: string }[]
     /** Count of registered providers — for a safe startup log (never logs the secrets themselves). */
     size: number
 }
@@ -57,12 +65,16 @@ export function buildSecretStore(rawEnv: string | undefined): SecretStore {
 
     // Index by a composite key so lookup is O(1) and cannot cross providers.
     const byKey = new Map<string, string>()
+    // Keep the public (blockName, clientId) pairs for discovery — never the secret.
+    const publicPairs: { blockName: string, clientId: string }[] = []
     for (const provider of providers) {
         byKey.set(compositeKey(provider.blockName, provider.clientId), provider.clientSecret)
+        publicPairs.push({ blockName: provider.blockName, clientId: provider.clientId })
     }
 
     return {
         lookup: ({ blockName, clientId }) => byKey.get(compositeKey(blockName, clientId)) ?? null,
+        list: () => publicPairs.map((pair) => ({ ...pair })),
         size: byKey.size,
     }
 }

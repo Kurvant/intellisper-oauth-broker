@@ -77,6 +77,12 @@ async function build(): Promise<ReturnType<typeof Fastify>> {
 
     app.get('/health', async () => ({ status: 'ok', providers: store.size }))
 
+    // Discovery: the authenticated platform asks which providers are broker-managed so its connection
+    // dialog can offer a one-click Connect (CLOUD_OAUTH2) instead of prompting for the user's own
+    // client id/secret. Returns PUBLIC identity only — (blockName, clientId) — never the secret. This
+    // route is behind the same API-key gate as /claim and /refresh (the onRequest hook above).
+    app.get('/providers', async () => ({ providers: store.list() }))
+
     app.post('/claim', async (request, reply) => {
         const parsed = claimSchema.safeParse(request.body)
         if (!parsed.success) {
