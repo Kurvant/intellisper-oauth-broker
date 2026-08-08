@@ -1,7 +1,12 @@
-import { createHash, timingSafeEqual } from 'crypto'
+import { createHash } from 'crypto'
 import rateLimit from '@fastify/rate-limit'
-import Fastify from 'fastify'
+import Fastify, { FastifyInstance } from 'fastify'
 import { z } from 'zod'
+import { brokerAuth } from './auth/scopes'
+import { type Db, getDb, isLicensingEnabled } from './db/db'
+import { runMigrations } from './db/migrate'
+import { registerExtendTrialRoute, registerPublicLicenseRoutes } from './licenses/routes-public'
+import { registerManageLicenseRoutes } from './licenses/routes-manage'
 import { claimCode, refreshToken } from './oauth-exchange'
 import { buildSecretStore } from './secret-store'
 import { assertPublicHttpsUrl } from './ssrf-guard'
@@ -44,7 +49,14 @@ const refreshSchema = z.object({
     edition: z.string().optional(),
 })
 
-async function build(): Promise<ReturnType<typeof Fastify>> {
+export type BuildOptions = {
+    // Injected in tests so the broker runs against pg-mem with a deterministic clock. In
+    // production these default to the real pg pool and the system clock.
+    db?: Db
+    now?: () => string
+}
+
+async function build(options: BuildOptions = {}): Promise<FastifyInstance> {
     const apiKey = requireEnv('BROKER_API_KEY')
     const apiKeyHash = sha256(apiKey)
     const store = buildSecretStore(process.env.OAUTH_PROVIDERS)
@@ -53,7 +65,8 @@ async function build(): Promise<ReturnType<typeof Fastify>> {
         logger: {
             level: process.env.LOG_LEVEL ?? 'info',
             // Belt-and-braces: redact anything secret-shaped that ever reaches a log line.
-            redact: ['req.headers.authorization', '*.clientSecret', '*.client_secret', '*.access_token', '*.refresh_token'],
+            // `*.key` covers the raw license key that flows through the management responses.
+            redact: ['req.headers.authorization', 'req.headers["api-key"]', '*.clientSecret', '*.client_secret', '*.access_token', '*.refresh_token', '*.key'],
         },
         // We never render caller-supplied URLs into error pages; keep bodies small.
         bodyLimit: 64 * 1024,
@@ -64,25 +77,30 @@ async function build(): Promise<ReturnType<typeof Fastify>> {
         timeWindow: process.env.RATE_LIMIT_WINDOW ?? '1 minute',
     })
 
-    // Auth gate on every route except health. Constant-time compare of a hash of the presented key.
-    app.addHook('onRequest', async (request, reply) => {
-        if (request.url === '/health') {
-            return
-        }
-        const presented = (request.headers.authorization ?? '').replace(/^Bearer\s+/i, '')
-        if (presented === '' || !constantTimeEqual(sha256(presented), apiKeyHash)) {
-            await reply.code(401).send({ error: 'unauthorized' })
-        }
+    app.get('/health', async () => ({ status: 'ok', providers: store.size, licensing: isLicensingEnabled() }))
+
+    // ── Scope 1: OAuth brokering (BROKER_API_KEY, Authorization: Bearer). Encapsulated so its
+    // auth hook applies ONLY to these routes — the global gate is gone.
+    const oauthGuard = brokerAuth.makeBearerGuard(apiKeyHash)
+    await app.register(async (oauth) => {
+        oauth.addHook('onRequest', oauthGuard)
+
+        // Discovery: PUBLIC identity only — (blockName, clientId) — never the secret.
+        oauth.get('/providers', async () => ({ providers: store.list() }))
+
+        registerOAuthExchangeRoutes(oauth, store)
     })
 
-    app.get('/health', async () => ({ status: 'ok', providers: store.size }))
+    // ── Scope 2 & 3: licensing. Registered only when DATABASE_URL is configured; when absent
+    // the license routes 503 (below) while OAuth keeps working — brokering must never depend on
+    // the license database.
+    await registerLicensing(app, options)
 
-    // Discovery: the authenticated platform asks which providers are broker-managed so its connection
-    // dialog can offer a one-click Connect (CLOUD_OAUTH2) instead of prompting for the user's own
-    // client id/secret. Returns PUBLIC identity only — (blockName, clientId) — never the secret. This
-    // route is behind the same API-key gate as /claim and /refresh (the onRequest hook above).
-    app.get('/providers', async () => ({ providers: store.list() }))
+    return app
+}
 
+// Extracted so the OAuth routes register inside the guarded scope above.
+function registerOAuthExchangeRoutes(app: FastifyInstance, store: ReturnType<typeof buildSecretStore>): void {
     app.post('/claim', async (request, reply) => {
         const parsed = claimSchema.safeParse(request.body)
         if (!parsed.success) {
@@ -140,8 +158,56 @@ async function build(): Promise<ReturnType<typeof Fastify>> {
             return reply.code(502).send({ error: 'exchange_failed' })
         }
     })
+}
 
-    return app
+// Registers the license scopes. When DATABASE_URL is unset (and no db is injected), the public
+// and management license routes return 503 with a single warning — OAuth brokering is unaffected.
+async function registerLicensing(app: FastifyInstance, options: BuildOptions): Promise<void> {
+    const licensingActive = options.db !== undefined || isLicensingEnabled()
+    const now = options.now ?? ((): string => new Date().toISOString())
+    const resolveDb = (): Db => options.db ?? getDb()
+
+    if (!licensingActive) {
+        // Advertise the surface but degrade gracefully so a misconfigured deploy fails loudly at
+        // the route, not silently. A single log line avoids noise.
+        app.log.warn('DATABASE_URL not set — license routes are disabled (503); OAuth brokering unaffected')
+        const degrade = async (_req: unknown, reply: { code: (n: number) => { send: (b: unknown) => unknown } }): Promise<unknown> =>
+            reply.code(503).send({ error: 'licensing_unavailable' })
+        app.post('/license-keys', degrade)
+        app.get('/license-keys/:key', degrade)
+        app.post('/license-keys/activate', degrade)
+        app.post('/license-keys/verify', degrade)
+        app.post('/license-keys/extend-trial', degrade)
+        app.all('/manage/*', degrade)
+        return
+    }
+
+    if (options.db === undefined) {
+        // Run migrations against the real database on boot (idempotent).
+        await runMigrations(getDb())
+    }
+
+    const autoIssueTrials = (process.env.TRIAL_AUTO_ISSUE ?? 'false') === 'true'
+    const trialDays = Number(process.env.TRIAL_DAYS ?? 14)
+    const publicDeps = { getDb: resolveDb, now, autoIssueTrials, trialDays }
+
+    // Scope 2: public license routes — NO api-key gate, tighter rate limit, uniform 404s.
+    await app.register(async (pub) => {
+        await pub.register(rateLimit, {
+            max: Number(process.env.LICENSE_RATE_LIMIT_MAX ?? 30),
+            timeWindow: process.env.LICENSE_RATE_LIMIT_WINDOW ?? '1 minute',
+        })
+        await registerPublicLicenseRoutes(pub, publicDeps)
+    })
+
+    // Scope 3: management routes + extend-trial — LICENSE_MANAGEMENT_API_KEY (api-key header).
+    const mgmtKey = requireEnv('LICENSE_MANAGEMENT_API_KEY')
+    const mgmtGuard = brokerAuth.makeManagementGuard(brokerAuth.sha256(mgmtKey))
+    await app.register(async (mgmt) => {
+        mgmt.addHook('onRequest', mgmtGuard)
+        await registerExtendTrialRoute(mgmt, publicDeps)
+        await registerManageLicenseRoutes(mgmt, { getDb: resolveDb, now })
+    })
 }
 
 async function start(): Promise<void> {
@@ -162,18 +228,17 @@ function sha256(input: string): Buffer {
     return createHash('sha256').update(input).digest()
 }
 
-function constantTimeEqual(a: Buffer, b: Buffer): boolean {
-    return a.length === b.length && timingSafeEqual(a, b)
-}
-
 function errMessage(err: unknown): string {
     return err instanceof Error ? err.message : String(err)
 }
 
-void start().catch((err) => {
-    // eslint-disable-next-line no-console
-    console.error('[oauth-broker] failed to start:', err)
-    process.exit(1)
-})
+// Only auto-start when run as the entrypoint (node dist/index.js), never on import from a test.
+if (require.main === module) {
+    void start().catch((err) => {
+        // eslint-disable-next-line no-console
+        console.error('[oauth-broker] failed to start:', err)
+        process.exit(1)
+    })
+}
 
 export { build }
